@@ -87,7 +87,6 @@ def test_call_expressions():
 
 
 @ti.test(arch=ti.cpu, experimental_real_function=True)
-@ti.must_throw(AssertionError)
 def test_failing_multiple_return():
     x = ti.field(ti.i32, shape=())
 
@@ -106,9 +105,10 @@ def test_failing_multiple_return():
         assert foo(10) == 0
         assert foo(100) == 1
 
-    x[None] = 0
-    run()
-    assert x[None] == 26
+    with pytest.raises(AssertionError):
+        x[None] = 0
+        run()
+        assert x[None] == 26
 
 
 @ti.test(experimental_real_function=True)
@@ -274,7 +274,7 @@ def test_missing_arg_annotation():
 
 @ti.test(experimental_real_function=True)
 def test_missing_return_annotation():
-    with pytest.raises(ti.TaichiSyntaxError,
+    with pytest.raises(ti.TaichiCompilationError,
                        match='return value must be annotated'):
 
         @ti.func

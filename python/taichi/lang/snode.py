@@ -5,10 +5,9 @@ import numbers
 # loaded during the import procedure, it's probably still good to delay the
 # access to it.
 import taichi.lang
-from taichi.core.util import ti_core as _ti_core
-from taichi.lang import impl
+from taichi._lib import core as _ti_core
+from taichi.lang import expr, impl, matrix
 from taichi.lang.field import Field
-from taichi.misc.util import deprecated
 
 
 class SNode:
@@ -102,10 +101,6 @@ class SNode:
             self.ptr.bitmasked(axes, dimensions,
                                impl.current_cfg().packed))
 
-    @deprecated('_bit_struct', 'bit_struct')
-    def _bit_struct(self, num_bits):
-        return self.bit_struct(num_bits)
-
     def bit_struct(self, num_bits: int):
         """Adds a bit_struct SNode as a child component of `self`.
 
@@ -116,10 +111,6 @@ class SNode:
             The added :class:`~taichi.lang.SNode` instance.
         """
         return SNode(self.ptr.bit_struct(num_bits, impl.current_cfg().packed))
-
-    @deprecated('_bit_array', 'bit_array')
-    def _bit_array(self, axes, dimensions, num_bits):
-        return self.bit_array(axes, dimensions, num_bits)
 
     def bit_array(self, axes, dimensions, num_bits):
         """Adds a bit_array SNode as a child component of `self`.
@@ -200,6 +191,20 @@ class SNode:
             return impl.root
         return SNode(p)
 
+    def path_from_root(self):
+        """Gets the path from root to `self` in the SNode tree.
+
+        Returns:
+            List[Union[_Root, SNode]]: The list of SNodes on the path from root to `self`.
+        """
+        p = self
+        res = [p]
+        while p != impl.root:
+            p = p.parent()
+            res.append(p)
+        res.reverse()
+        return res
+
     @property
     def dtype(self):
         """Gets the data type of `self`.
@@ -208,14 +213,6 @@ class SNode:
             DataType: The data type of `self`.
         """
         return self.ptr.data_type()
-
-    @deprecated('x.data_type()', 'x.dtype')
-    def data_type(self):
-        return self.dtype
-
-    @deprecated('x.dim()', 'len(x.shape)')
-    def dim(self):
-        return len(self.shape)
 
     @property
     def id(self):
@@ -234,19 +231,9 @@ class SNode:
             Tuple[int]: The number of elements from root in each axis of `self`.
         """
         dim = self.ptr.num_active_indices()
-        ret = [self.ptr.get_shape_along_axis(i) for i in range(dim)]
+        ret = tuple(self.ptr.get_shape_along_axis(i) for i in range(dim))
 
-        class callable_tuple(tuple):
-            @deprecated('x.shape()', 'x.shape')
-            def __call__(self):
-                return self
-
-        ret = callable_tuple(ret)
         return ret
-
-    @deprecated('x.get_shape(i)', 'x.shape[i]')
-    def get_shape(self, i):
-        return self.shape[i]
 
     def loop_range(self):
         """Gets the taichi_core.Expr wrapping the taichi_core.GlobalVariableExpression corresponding to `self` to serve as loop range.
@@ -297,14 +284,18 @@ class SNode:
     @property
     def num_dynamically_allocated(self):
         runtime = impl.get_runtime()
-        runtime.materialize()
+        runtime.materialize_root_fb(False)
         return runtime.prog.get_snode_num_dynamically_allocated(self.ptr)
 
     @property
     def cell_size_bytes(self):
-        runtime = impl.get_runtime()
-        runtime.materialize()
+        impl.get_runtime().materialize_root_fb(False)
         return self.ptr.cell_size_bytes
+
+    @property
+    def offset_bytes_in_parent_cell(self):
+        impl.get_runtime().materialize_root_fb(False)
+        return self.ptr.offset_bytes_in_parent_cell
 
     def deactivate_all(self):
         """Recursively deactivate all children components of `self`."""
@@ -347,3 +338,82 @@ class SNode:
             if physical != -1:
                 ret[virtual] = physical
         return ret
+
+
+def rescale_index(a, b, I):
+    """Rescales the index 'I' of field (or SNode) 'a' to match the shape of SNode 'b'
+
+    Parameters
+    ----------
+    a: ti.field(), ti.Vector.field, ti.Matrix.field()
+        input taichi field or snode
+    b: ti.field(), ti.Vector.field, ti.Matrix.field()
+        output taichi field or snode
+    I: ti.Vector()
+        grouped loop index
+
+    Returns
+    -------
+    Ib: ti.Vector()
+        rescaled grouped loop index
+
+    """
+    assert isinstance(
+        a, (Field, SNode)), "The first argument must be a field or an SNode"
+    assert isinstance(
+        b, (Field, SNode)), "The second argument must be a field or an SNode"
+    if isinstance(I, list):
+        I = matrix.Vector(I)
+    else:
+        assert isinstance(
+            I, matrix.Matrix
+        ), "The third argument must be an index (list or ti.Vector)"
+    entries = [I(i) for i in range(I.n)]
+    for n in range(min(I.n, min(len(a.shape), len(b.shape)))):
+        if a.shape[n] > b.shape[n]:
+            entries[n] = I(n) // (a.shape[n] // b.shape[n])
+        if a.shape[n] < b.shape[n]:
+            entries[n] = I(n) * (b.shape[n] // a.shape[n])
+    return matrix.Vector(entries)
+
+
+def append(l, indices, val):
+    a = impl.expr_init(
+        _ti_core.insert_append(l.snode.ptr, expr.make_expr_group(indices),
+                               expr.Expr(val).ptr))
+    return a
+
+
+def is_active(l, indices):
+    return expr.Expr(
+        _ti_core.insert_is_active(l.snode.ptr, expr.make_expr_group(indices)))
+
+
+def activate(l, indices):
+    _ti_core.insert_activate(l.snode.ptr, expr.make_expr_group(indices))
+
+
+def deactivate(l, indices):
+    _ti_core.insert_deactivate(l.snode.ptr, expr.make_expr_group(indices))
+
+
+def length(l, indices):
+    return expr.Expr(
+        _ti_core.insert_len(l.snode.ptr, expr.make_expr_group(indices)))
+
+
+def get_addr(f, indices):
+    """Query the memory address (on CUDA/x64) of field `f` at index `indices`.
+
+    Currently, this function can only be called inside a taichi kernel.
+
+    Args:
+        f (Union[ti.field, ti.Vector.field, ti.Matrix.field]): Input taichi field for memory address query.
+        indices (Union[int, ti.Vector()]): The specified field indices of the query.
+
+    Returns:
+        ti.u64:  The memory address of `f[indices]`.
+
+    """
+    return expr.Expr(
+        _ti_core.expr_get_addr(f.snode.ptr, expr.make_expr_group(indices)))

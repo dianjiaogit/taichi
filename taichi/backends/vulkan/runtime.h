@@ -4,8 +4,9 @@
 #include <vector>
 
 #include "taichi/backends/device.h"
-#include "taichi/backends/vulkan/snode_struct_compiler.h"
-#include "taichi/backends/vulkan/kernel_utils.h"
+#include "taichi/codegen/spirv/snode_struct_compiler.h"
+#include "taichi/codegen/spirv/kernel_utils.h"
+#include "taichi/codegen/spirv/spirv_codegen.h"
 #include "taichi/program/compile_config.h"
 #include "taichi/struct/snode_tree.h"
 #include "taichi/program/snode_expr_utils.h"
@@ -13,6 +14,8 @@
 namespace taichi {
 namespace lang {
 namespace vulkan {
+
+using namespace taichi::lang::spirv;
 
 using BufferType = TaskAttributes::BufferType;
 using BufferInfo = TaskAttributes::BufferInfo;
@@ -43,11 +46,14 @@ class CompiledTaichiKernel {
 
   size_t num_pipelines() const;
 
-  DeviceAllocation *ctx_buffer() const;
+  // DeviceAllocation *ctx_buffer() const;
+  // DeviceAllocation *ctx_buffer_host() const;
 
-  DeviceAllocation *ctx_buffer_host() const;
+  size_t get_ctx_buffer_size() const;
 
-  void command_list(CommandList *cmdlist) const;
+  void generate_command_list(CommandList *cmdlist,
+                             DeviceAllocationGuard *ctx_buffer_host,
+                             DeviceAllocationGuard *ctx_buffer) const;
 
  private:
   TaichiKernelAttributes ti_kernel_attribs_;
@@ -57,8 +63,7 @@ class CompiledTaichiKernel {
 
   InputBuffersMap input_buffers_;
 
-  std::unique_ptr<DeviceAllocationGuard> ctx_buffer_{nullptr};
-  std::unique_ptr<DeviceAllocationGuard> ctx_buffer_host_{nullptr};
+  size_t ctx_buffer_size_{0};
   std::vector<std::unique_ptr<Pipeline>> pipelines_;
 };
 
@@ -100,9 +105,10 @@ class VkRuntime {
 
   DevicePtr get_snode_tree_device_ptr(int tree_id);
 
+  void add_root_buffer(size_t root_buffer_size);
+
  private:
   void init_buffers();
-  void add_root_buffer(size_t root_buffer_size);
 
   Device *device_;
 
@@ -113,12 +119,19 @@ class VkRuntime {
   // FIXME: Support proper multiple lists
   std::unique_ptr<DeviceAllocationGuard> listgen_buffer_;
 
+  std::vector<std::unique_ptr<DeviceAllocationGuard>> ctx_buffers_;
+
   std::unique_ptr<CommandList> current_cmdlist_{nullptr};
 
   std::vector<std::unique_ptr<CompiledTaichiKernel>> ti_kernels_;
 
   std::vector<CompiledSNodeStructs> compiled_snode_structs_;
 };
+
+VkRuntime::RegisterParams run_codegen(
+    Kernel *kernel,
+    Device *device,
+    const std::vector<CompiledSNodeStructs> &compiled_structs);
 
 }  // namespace vulkan
 }  // namespace lang

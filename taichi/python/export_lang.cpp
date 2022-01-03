@@ -3,7 +3,9 @@
 #include <optional>
 #include <string>
 
+#if TI_WITH_LLVM
 #include "llvm/Config/llvm-config.h"
+#endif
 
 #include "pybind11/functional.h"
 #include "pybind11/pybind11.h"
@@ -77,6 +79,7 @@ TI_NAMESPACE_BEGIN
 void export_lang(py::module &m) {
   using namespace taichi::lang;
 
+  py::register_exception<TaichiTypeError>(m, "TypeError", PyExc_TypeError);
   py::enum_<Arch>(m, "Arch", py::arithmetic())
 #define PER_ARCH(x) .value(#x, Arch::x)
 #include "taichi/inc/archs.inc.h"
@@ -129,6 +132,7 @@ void export_lang(py::module &m) {
   py::class_<CompileConfig>(m, "CompileConfig")
       .def(py::init<>())
       .def_readwrite("arch", &CompileConfig::arch)
+      .def_readwrite("opt_level", &CompileConfig::opt_level)
       .def_readwrite("packed", &CompileConfig::packed)
       .def_readwrite("print_ir", &CompileConfig::print_ir)
       .def_readwrite("print_preprocessed_ir",
@@ -187,6 +191,8 @@ void export_lang(py::module &m) {
       .def_readwrite("make_block_local", &CompileConfig::make_block_local)
       .def_readwrite("detect_read_only", &CompileConfig::detect_read_only)
       .def_readwrite("ndarray_use_torch", &CompileConfig::ndarray_use_torch)
+      .def_readwrite("ndarray_use_cached_allocator",
+                     &CompileConfig::ndarray_use_cached_allocator)
       .def_readwrite("cc_compile_cmd", &CompileConfig::cc_compile_cmd)
       .def_readwrite("cc_link_cmd", &CompileConfig::cc_link_cmd)
       .def_readwrite("async_opt_passes", &CompileConfig::async_opt_passes)
@@ -210,6 +216,7 @@ void export_lang(py::module &m) {
                      &CompileConfig::quant_opt_atomic_demotion)
       .def_readwrite("allow_nv_shader_extension",
                      &CompileConfig::allow_nv_shader_extension)
+      .def_readwrite("use_gles", &CompileConfig::use_gles)
       .def_readwrite("make_mesh_block_local",
                      &CompileConfig::make_mesh_block_local)
       .def_readwrite("mesh_localize_to_end_mapping",
@@ -398,6 +405,8 @@ void export_lang(py::module &m) {
       .def("num_active_indices",
            [](SNode *snode) { return snode->num_active_indices; })
       .def_readonly("cell_size_bytes", &SNode::cell_size_bytes)
+      .def_readonly("offset_bytes_in_parent_cell",
+                    &SNode::offset_bytes_in_parent_cell)
       .def("begin_shared_exp_placement", &SNode::begin_shared_exp_placement)
       .def("end_shared_exp_placement", &SNode::end_shared_exp_placement);
 
@@ -410,8 +419,12 @@ void export_lang(py::module &m) {
   py::class_<Ndarray>(m, "Ndarray")
       .def(py::init<Program *, const DataType &, const std::vector<int> &>())
       .def("data_ptr", &Ndarray::get_data_ptr_as_int)
+      .def("device_allocation_ptr", &Ndarray::get_device_allocation_ptr_as_int)
       .def("element_size", &Ndarray::get_element_size)
       .def("nelement", &Ndarray::get_nelement)
+      .def("fill_float", &Ndarray::fill_float)
+      .def("fill_int", &Ndarray::fill_int)
+      .def("fill_uint", &Ndarray::fill_uint)
       .def("read_int",
            [](Ndarray *ndarray, const std::vector<int> &I) -> int64 {
              return get_ndarray_rw_accessors(ndarray).read_int(I);
@@ -712,6 +725,7 @@ void export_lang(py::module &m) {
 
   m.def("expr_neg", [&](const Expr &e) { return -e; });
   DEFINE_EXPRESSION_OP_UNARY(sqrt)
+  DEFINE_EXPRESSION_OP_UNARY(round)
   DEFINE_EXPRESSION_OP_UNARY(floor)
   DEFINE_EXPRESSION_OP_UNARY(ceil)
   DEFINE_EXPRESSION_OP_UNARY(abs)
@@ -755,7 +769,8 @@ void export_lang(py::module &m) {
       for (int d = 0; d < (int)shape.size(); ++d)
         indices.push_back(reversed_indices[(int)shape.size() - 1 - d]);
       current_ast_builder().insert(std::make_unique<FrontendAssignStmt>(
-          Expr::make<TensorElementExpression>(var, indices, shape, 1),
+          Expr::make<TensorElementExpression>(var, indices, shape,
+                                              data_type_size(element_type)),
           load_if_ptr(elements.exprs[i])));
     }
     return var;
@@ -805,6 +820,7 @@ void export_lang(py::module &m) {
 #include "taichi/inc/data_type.inc.h"
 #undef PER_TYPE
 
+  m.def("data_type_size", data_type_size);
   m.def("is_custom_type", is_custom_type);
   m.def("is_integral", is_integral);
   m.def("is_signed", is_signed);
@@ -822,28 +838,9 @@ void export_lang(py::module &m) {
     return expr[expr_group];
   });
 
-  m.def("global_subscript_with_offset",
-        [](const Expr &var, const ExprGroup &indices,
-           const std::vector<int> &shape, bool is_aos) {
-          // TODO: Add test for dimension check
-          if (is_aos)
-            return Expr::make<TensorElementExpression>(var, indices, shape, 1);
-          else {
-            SNode *snode = var.cast<GlobalPtrExpression>()
-                               ->var.cast<GlobalVariableExpression>()
-                               ->snode;
-            return Expr::make<TensorElementExpression>(
-                var, indices, shape,
-                snode->get_total_num_elements_towards_root());
-          }
-        });
-
-  m.def("local_subscript_with_offset",
-        [](const Expr &var, const ExprGroup &indices,
-           const std::vector<int> &shape) {
-          // TODO: Add test for dimension check
-          return Expr::make<TensorElementExpression>(var, indices, shape, 1);
-        });
+  m.def("make_tensor_element_expr",
+        Expr::make<TensorElementExpression, const Expr &, const ExprGroup &,
+                   const std::vector<int> &, int>);
 
   m.def("subscript", [](SNode *snode, const ExprGroup &indices) {
     return Expr::make<GlobalPtrExpression>(snode, indices.loaded());
@@ -912,10 +909,15 @@ void export_lang(py::module &m) {
               std::make_unique<FrontendPrintStmt>(contents));
         });
 
-  m.def("decl_arg", [&](const DataType &dt, bool is_external_array) {
-    return get_current_program().current_callable->insert_arg(
-        dt, is_external_array);
+  m.def("decl_arg", [&](const DataType &dt, bool is_array) {
+    return get_current_program().current_callable->insert_arg(dt, is_array);
   });
+
+  m.def("decl_arr_arg",
+        [&](const DataType &dt, int total_dim, std::vector<int> shape) {
+          return get_current_program().current_callable->insert_arr_arg(
+              dt, total_dim, shape);
+        });
 
   m.def("decl_ret", [&](const DataType &dt) {
     return get_current_program().current_callable->insert_ret(dt);
@@ -1005,7 +1007,9 @@ void export_lang(py::module &m) {
   m.def("get_version_major", get_version_major);
   m.def("get_version_minor", get_version_minor);
   m.def("get_version_patch", get_version_patch);
+#if TI_WITH_LLVM
   m.def("get_llvm_version_string", [] { return LLVM_VERSION_STRING; });
+#endif
   m.def("test_printf", [] { printf("test_printf\n"); });
   m.def("test_logging", [] { TI_INFO("test_logging"); });
   m.def("trigger_crash", [] { *(int *)(1) = 0; });

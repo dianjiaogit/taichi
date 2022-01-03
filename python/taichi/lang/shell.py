@@ -2,8 +2,8 @@ import functools
 import os
 import sys
 
+from taichi._lib import core as _ti_core
 from taichi._logging import info, warn
-from taichi.core.util import ti_core as _ti_core
 
 try:
     import sourceinspect as oinspect  # pylint: disable=unused-import
@@ -34,7 +34,6 @@ def _shell_pop_print(old_call):
 
     @functools.wraps(old_call)
     def new_call(*args, **kwargs):
-        _taichi_skip_traceback = 1
         ret = old_call(*args, **kwargs)
         # print's in kernel won't take effect until ti.sync(), discussion:
         # https://github.com/taichi-dev/taichi/pull/1303#discussion_r444897102

@@ -3,26 +3,27 @@ from types import FunctionType, MethodType
 from typing import Iterable
 
 import numpy as np
-from taichi.core.util import ti_core as _ti_core
+from taichi._lib import core as _ti_core
 from taichi.lang._ndarray import ScalarNdarray
 from taichi.lang.any_array import AnyArray, AnyArrayAccess
 from taichi.lang.exception import InvalidOperationError
 from taichi.lang.expr import Expr, make_expr_group
 from taichi.lang.field import Field, ScalarField
 from taichi.lang.kernel_arguments import SparseMatrixProxy
-from taichi.lang.matrix import MatrixField, _IntermediateMatrix
+from taichi.lang.matrix import (Matrix, MatrixField, _IntermediateMatrix,
+                                _MatrixFieldElement)
 from taichi.lang.mesh import (ConvType, MeshElementFieldProxy, MeshInstance,
                               MeshRelationAccessProxy,
                               MeshReorderedMatrixFieldProxy,
                               MeshReorderedScalarFieldProxy, element_type_name)
 from taichi.lang.snode import SNode
-from taichi.lang.struct import StructField, _IntermediateStruct
+from taichi.lang.struct import Struct, StructField, _IntermediateStruct
 from taichi.lang.tape import TapeImpl
 from taichi.lang.util import (cook_dtype, is_taichi_class, python_scope,
                               taichi_scope)
-from taichi.misc.util import deprecated, get_traceback, warning
 from taichi.snode.fields_builder import FieldsBuilder
-from taichi.type.primitive_types import f16, f32, f64, i32, i64, u32, u64
+from taichi.tools.util import get_traceback, warning
+from taichi.types.primitive_types import f16, f32, f64, i32, i64, u32, u64
 
 import taichi as ti
 
@@ -36,8 +37,10 @@ def expr_init_local_tensor(shape, element_type, elements):
 def expr_init(rhs):
     if rhs is None:
         return Expr(_ti_core.expr_alloca())
-    if is_taichi_class(rhs):
-        return rhs
+    if isinstance(rhs, Matrix):
+        return Matrix(rhs.to_list())
+    if isinstance(rhs, Struct):
+        return Struct(rhs.to_dict())
     if isinstance(rhs, list):
         return [expr_init(e) for e in rhs]
     if isinstance(rhs, tuple):
@@ -66,7 +69,7 @@ def expr_init_list(xs, expected):
     if isinstance(xs, ti.Matrix):
         if not xs.m == 1:
             raise ValueError(
-                f'Matrices with more than one columns cannot be unpacked')
+                'Matrices with more than one columns cannot be unpacked')
         xs = xs.entries
     if expected != len(xs):
         raise ValueError(
@@ -119,7 +122,6 @@ def wrap_scalar(x):
 
 @taichi_scope
 def subscript(value, *_indices, skip_reordered=False):
-    _taichi_skip_traceback = 1
     if isinstance(value, np.ndarray):
         return value.__getitem__(*_indices)
 
@@ -177,10 +179,7 @@ def subscript(value, *_indices, skip_reordered=False):
                 f'Field with dim {field_dim} accessed with indices of dim {index_dim}'
             )
         if isinstance(value, MatrixField):
-            return _IntermediateMatrix(value.n, value.m, [
-                Expr(_ti_core.subscript(e.ptr, indices_expr_group))
-                for e in value.get_field_members()
-            ])
+            return _MatrixFieldElement(value, indices_expr_group)
         if isinstance(value, StructField):
             return _IntermediateStruct(
                 {k: subscript(v, *_indices)
@@ -218,45 +217,10 @@ def subscript(value, *_indices, skip_reordered=False):
 
 
 @taichi_scope
-def local_subscript_with_offset(_var, _indices, shape):
+def make_tensor_element_expr(_var, _indices, shape, stride):
     return Expr(
-        _ti_core.local_subscript_with_offset(_var, make_expr_group(*_indices),
-                                             shape))
-
-
-@taichi_scope
-def global_subscript_with_offset(_var, _indices, shape, is_aos):
-    return Expr(
-        _ti_core.global_subscript_with_offset(_var.ptr,
-                                              make_expr_group(*_indices),
-                                              shape, is_aos))
-
-
-@taichi_scope
-def chain_compare(comparators, ops):
-    _taichi_skip_traceback = 1
-    assert len(comparators) == len(ops) + 1, \
-      f'Chain comparison invoked with {len(comparators)} comparators but {len(ops)} operators'
-    ret = True
-    for i, op in enumerate(ops):
-        lhs = comparators[i]
-        rhs = comparators[i + 1]
-        if op == 'Lt':
-            now = lhs < rhs
-        elif op == 'LtE':
-            now = lhs <= rhs
-        elif op == 'Gt':
-            now = lhs > rhs
-        elif op == 'GtE':
-            now = lhs >= rhs
-        elif op == 'Eq':
-            now = lhs == rhs
-        elif op == 'NotEq':
-            now = lhs != rhs
-        else:
-            assert False, f'Unknown operator {op}'
-        ret = ti.logical_and(ret, now)
-    return ret
+        _ti_core.make_tensor_element_expr(_var, make_expr_group(*_indices),
+                                          shape, stride))
 
 
 @taichi_scope
@@ -291,20 +255,20 @@ class PyTaichi:
     def __init__(self, kernels=None):
         self.materialized = False
         self.prog = None
-        self.materialize_callbacks = []
         self.compiled_functions = {}
         self.compiled_grad_functions = {}
         self.scope_stack = []
         self.inside_kernel = False
         self.current_kernel = None
         self.global_vars = []
-        self.print_preprocessed = False
+        self.matrix_fields = []
         self.experimental_real_function = False
         self.default_fp = f32
         self.default_ip = i32
         self.target_tape = None
         self.grad_replaced = False
         self.kernels = kernels or []
+        self._signal_handler_registry = None
 
     def get_num_compiled_functions(self):
         return len(self.compiled_functions) + len(self.compiled_grad_functions)
@@ -345,18 +309,15 @@ class PyTaichi:
                 'AOT: can only finalize the root FieldsBuilder once')
         _root_fb._finalize_for_aot()
 
-    def materialize(self):
-        self.materialize_root_fb(not self.materialized)
+    @staticmethod
+    def _get_tb(_var):
+        return getattr(_var, 'declaration_tb', str(_var.ptr))
 
-        if self.materialized:
-            return
-
-        self.materialized = True
+    def _check_field_not_placed(self):
         not_placed = []
         for _var in self.global_vars:
             if _var.ptr.snode() is None:
-                tb = getattr(_var, 'declaration_tb', str(_var.ptr))
-                not_placed.append(tb)
+                not_placed.append(self._get_tb(_var))
 
         if len(not_placed):
             bar = '=' * 44 + '\n'
@@ -366,14 +327,41 @@ class PyTaichi:
                 f'{bar}Please consider specifying a shape for them. E.g.,' +
                 '\n\n  x = ti.field(float, shape=(2, 3))')
 
-        for callback in self.materialize_callbacks:
-            callback()
-        self.materialize_callbacks = []
+    def _check_matrix_field_member_shape(self):
+        for _field in self.matrix_fields:
+            shapes = [
+                _field.get_scalar_field(i, j).shape for i in range(_field.n)
+                for j in range(_field.m)
+            ]
+            if any(shape != shapes[0] for shape in shapes):
+                raise RuntimeError(
+                    'Members of the following field have different shapes ' +
+                    f'{shapes}:\n{self._get_tb(_field.get_field_members()[0])}'
+                )
+
+    def _calc_matrix_field_dynamic_index_stride(self):
+        for _field in self.matrix_fields:
+            _field.calc_dynamic_index_stride()
+
+    def materialize(self):
+        self.materialize_root_fb(not self.materialized)
+        self.materialized = True
+
+        self._check_field_not_placed()
+        self._check_matrix_field_member_shape()
+        self._calc_matrix_field_dynamic_index_stride()
+        self.global_vars = []
+        self.matrix_fields = []
+
+    def _register_signal_handlers(self):
+        if self._signal_handler_registry is None:
+            self._signal_handler_registry = _ti_core.HackedSignalRegister()
 
     def clear(self):
         if self.prog:
             self.prog.finalize()
             self.prog = None
+        self._signal_handler_registry = None
         self.materialized = False
 
     def get_tape(self, loss=None):
@@ -391,17 +379,13 @@ def get_runtime():
     return pytaichi
 
 
-def materialize_callback(foo):
-    get_runtime().materialize_callbacks.append(foo)
-
-
 def _clamp_unsigned_to_range(npty, val):
     # npty: np.int32 or np.int64
     iif = np.iinfo(npty)
     if iif.min <= val <= iif.max:
         return val
     cap = (1 << iif.bits)
-    if not (0 <= val < cap):
+    if not 0 <= val < cap:
         # We let pybind11 fail intentionally, because this isn't the case we want
         # to deal with: |val| does't fall into the valid range of either
         # the signed or the unsigned type.
@@ -415,7 +399,6 @@ def _clamp_unsigned_to_range(npty, val):
 
 @taichi_scope
 def make_constant_expr_i32(val):
-    _taichi_skip_traceback = 1
     assert isinstance(val, (int, np.integer))
     return Expr(
         _ti_core.make_const_expr_i32(_clamp_unsigned_to_range(np.int32, val)))
@@ -423,7 +406,6 @@ def make_constant_expr_i32(val):
 
 @taichi_scope
 def make_constant_expr(val):
-    _taichi_skip_traceback = 1
     if isinstance(val, (int, np.integer)):
         if pytaichi.default_ip in {i32, u32}:
             # It is not always correct to do such clamp without the type info on
@@ -467,7 +449,6 @@ def static_print(*args, __p=print, **kwargs):
 
 # we don't add @taichi_scope decorator for @ti.pyfunc to work
 def static_assert(cond, msg=None):
-    _taichi_skip_traceback = 1
     if msg is not None:
         assert cond, msg
     else:
@@ -564,7 +545,7 @@ def create_field_member(dtype, name):
 
     # primal
     x = Expr(_ti_core.make_id_expr(""))
-    x.declaration_tb = get_traceback(stacklevel=2)
+    x.declaration_tb = get_traceback(stacklevel=4)
     x.ptr = _ti_core.global_new(x.ptr, dtype)
     x.ptr.set_name(name)
     x.ptr.set_is_primal(True)
@@ -580,12 +561,6 @@ def create_field_member(dtype, name):
         x.ptr.set_grad(x_grad.ptr)
 
     return x, x_grad
-
-
-@deprecated('ti.var', 'ti.field')
-def var(dt, shape=None, offset=None, needs_grad=False):
-    _taichi_skip_traceback = 1
-    return field(dt, shape, offset, needs_grad)
 
 
 @python_scope
@@ -616,7 +591,6 @@ def field(dtype, shape=None, name="", offset=None, needs_grad=False):
             >>> x2 = ti.field(ti.f32)
             >>> ti.root.dense(ti.ij, shape=(16, 8)).place(x2)
     """
-    _taichi_skip_traceback = 1
 
     if isinstance(shape, numbers.Number):
         shape = (shape, )
@@ -630,9 +604,7 @@ def field(dtype, shape=None, name="", offset=None, needs_grad=False):
         ), f'The dimensionality of shape and offset must be the same  ({len(shape)} != {len(offset)})'
 
     assert (offset is None or shape
-            is not None), f'The shape cannot be None when offset is being set'
-
-    del _taichi_skip_traceback
+            is not None), 'The shape cannot be None when offset is being set'
 
     x, x_grad = create_field_member(dtype, name)
     x, x_grad = ScalarField(x), ScalarField(x_grad)
@@ -684,7 +656,6 @@ def ti_print(*_vars, sep=' ', end='\n'):
             if hasattr(_var, '__ti_repr__'):
                 res = _var.__ti_repr__()
             elif isinstance(_var, (list, tuple)):
-                res = _var
                 # If the first element is '__ti_format__', this list is the result of ti_format.
                 if len(_var) > 0 and isinstance(
                         _var[0], str) and _var[0] == '__ti_format__':
@@ -770,7 +741,6 @@ def ti_assert(cond, msg, extra_args):
 
 @taichi_scope
 def ti_int(_var):
-    _taichi_skip_traceback = 1
     if hasattr(_var, '__ti_int__'):
         return _var.__ti_int__()
     return int(_var)
@@ -778,7 +748,6 @@ def ti_int(_var):
 
 @taichi_scope
 def ti_float(_var):
-    _taichi_skip_traceback = 1
     if hasattr(_var, '__ti_float__'):
         return _var.__ti_float__()
     return float(_var)
@@ -825,14 +794,6 @@ def axes(*x: Iterable[int]):
     return [_ti_core.Axis(i) for i in x]
 
 
-@deprecated("ti.indices", "ti.axes")
-def indices(*x):
-    """Same as :func:`~taichi.lang.impl.axes`."""
-    return [_ti_core.Axis(i) for i in x]
-
-
-index = indices
-
 Axis = _ti_core.Axis
 
 
@@ -876,7 +837,6 @@ def static(x, *xs):
             >>>     print(1)
             >>>     print(2)
     """
-    _taichi_skip_traceback = 1
     if len(xs):  # for python-ish pointer assign: x, y = ti.static(y, x)
         return [static(x)] + [static(x) for x in xs]
 

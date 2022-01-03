@@ -1,17 +1,18 @@
 import json
 
 import numpy as np
-from taichi.core.util import ti_core as _ti_core
+from taichi._lib import core as _ti_core
 from taichi.lang import impl
 from taichi.lang.enums import Layout
 from taichi.lang.exception import TaichiSyntaxError
 from taichi.lang.field import Field, ScalarField
-from taichi.lang.matrix import MatrixField, _IntermediateMatrix
+from taichi.lang.matrix import (MatrixField, _IntermediateMatrix,
+                                _MatrixFieldElement)
 from taichi.lang.struct import StructField
-from taichi.lang.types import CompoundType
 from taichi.lang.util import python_scope
+from taichi.types import CompoundType, i32
 
-import taichi as ti
+from taichi import lang
 
 MeshTopology = _ti_core.MeshTopology
 MeshElementType = _ti_core.MeshElementType
@@ -65,6 +66,7 @@ class MeshReorderedMatrixFieldProxy(MatrixField):
         self.grad = field.grad
         self.n = field.n
         self.m = field.m
+        self.dynamic_index_stride = field.dynamic_index_stride
 
         self.mesh_ptr = mesh_ptr
         self.element_type = element_type
@@ -121,7 +123,6 @@ class MeshElementField:
                 else:
                     self.getter_dict[key] = self.field_dict[key]
             """Get an entry from custom struct by name."""
-            _taichi_skip_traceback = 1
             return self.getter_dict[key]
 
         return getter
@@ -233,7 +234,8 @@ class MeshElement:
                             size).place(*tuple(field_dict.values()))
             grads = []
             for key, field in field_dict.items():
-                if self.attr_dict[key].needs_grad: grads.append(field.grad)
+                if self.attr_dict[key].needs_grad:
+                    grads.append(field.grad)
             if len(grads) > 0:
                 impl.root.dense(impl.axes(0), size).place(*grads)
 
@@ -315,15 +317,15 @@ class MeshMetadata:
             element["g2r_mapping"] = np.array(element["g2r_mapping"])
             self.element_fields[element_type] = {}
             self.element_fields[element_type]["owned"] = impl.field(
-                dtype=ti.i32, shape=self.num_patches + 1)
+                dtype=i32, shape=self.num_patches + 1)
             self.element_fields[element_type]["total"] = impl.field(
-                dtype=ti.i32, shape=self.num_patches + 1)
+                dtype=i32, shape=self.num_patches + 1)
             self.element_fields[element_type]["l2g"] = impl.field(
-                dtype=ti.i32, shape=element["l2g_mapping"].shape[0])
+                dtype=i32, shape=element["l2g_mapping"].shape[0])
             self.element_fields[element_type]["l2r"] = impl.field(
-                dtype=ti.i32, shape=element["l2r_mapping"].shape[0])
+                dtype=i32, shape=element["l2r_mapping"].shape[0])
             self.element_fields[element_type]["g2r"] = impl.field(
-                dtype=ti.i32, shape=element["g2r_mapping"].shape[0])
+                dtype=i32, shape=element["g2r_mapping"].shape[0])
 
         for relation in data["relations"]:
             from_order = relation["from_order"]
@@ -332,10 +334,10 @@ class MeshMetadata:
                 relation_by_orders(from_order, to_order))
             self.relation_fields[rel_type] = {}
             self.relation_fields[rel_type]["value"] = impl.field(
-                dtype=ti.i32, shape=len(relation["value"]))
+                dtype=i32, shape=len(relation["value"]))
             if from_order <= to_order:
                 self.relation_fields[rel_type]["offset"] = impl.field(
-                    dtype=ti.i32, shape=len(relation["offset"]))
+                    dtype=i32, shape=len(relation["offset"]))
 
         for element in data["elements"]:
             element_type = MeshElementType(element["order"])
@@ -368,8 +370,9 @@ class MeshMetadata:
 # Define the Mesh Type, stores the field type info
 class MeshBuilder:
     def __init__(self, topology):
-        if not ti.is_extension_supported(ti.cfg.arch, ti.extension.mesh):
-            raise Exception('Backend ' + str(ti.cfg.arch) +
+        if not lang.is_extension_supported(impl.current_cfg().arch,
+                                           lang.extension.mesh):
+            raise Exception('Backend ' + str(impl.current_cfg().arch) +
                             ' doesn\'t support MeshTaichi extension')
 
         self.topology = topology
@@ -475,13 +478,8 @@ class MeshElementFieldProxy:
             global_entry_expr_group = impl.make_expr_group(
                 *tuple([global_entry_expr]))
             if isinstance(attr, MatrixField):
-                setattr(
-                    self, key,
-                    _IntermediateMatrix(attr.n, attr.m, [
-                        impl.Expr(
-                            _ti_core.subscript(e.ptr, global_entry_expr_group))
-                        for e in attr.get_field_members()
-                    ]))
+                setattr(self, key,
+                        _MatrixFieldElement(attr, global_entry_expr_group))
             elif isinstance(attr, StructField):
                 raise RuntimeError('ti.Mesh has not support StructField yet')
             else:  # isinstance(attr, Field)
@@ -522,7 +520,7 @@ class MeshRelationAccessProxy:
                                        self.to_element_type))
 
     def subscript(self, *indices):
-        assert (len(indices) == 1)
+        assert len(indices) == 1
         entry_expr = _ti_core.get_relation_access(self.mesh.mesh_ptr,
                                                   self.from_index.ptr,
                                                   self.to_element_type,

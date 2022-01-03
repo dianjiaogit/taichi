@@ -4,6 +4,7 @@
 
 #include "taichi/common/core.h"
 #include "taichi/backends/cuda/cuda_driver.h"
+#include "taichi/backends/cuda/cuda_caching_allocator.h"
 #include "taichi/backends/cuda/cuda_context.h"
 #include "taichi/backends/device.h"
 
@@ -80,17 +81,27 @@ class CudaDevice : public Device {
     void *ptr{nullptr};
     size_t size{0};
     bool is_imported{false};
+    /* Note: Memory allocation in CUDA device.
+     * CudaDevice can use either its own cuda malloc mechanism via
+     * `allocate_memory` or the preallocated memory managed by Llvmprogramimpl
+     * via `allocate_memory_runtime`. The `use_preallocated` is used to track
+     * this option. For now, we keep both options and the preallocated method is
+     * used by default for CUDA backend. The `use_cached` is to enable/disable
+     * the caching behavior in `allocate_memory_runtime`. Later it should be
+     * always enabled, for now we keep both options to allow a scenario when
+     * using preallocated memory while disabling the caching behavior.
+     * */
+    bool use_preallocated{true};
+    bool use_cached{false};
   };
 
-  AllocInfo get_alloc_info(DeviceAllocation handle);
+  AllocInfo get_alloc_info(const DeviceAllocation handle);
 
   ~CudaDevice() override{};
 
   DeviceAllocation allocate_memory(const AllocParams &params) override;
-  DeviceAllocation allocate_memory_runtime(const AllocParams &params,
-                                           JITModule *runtime_jit_module,
-                                           LLVMRuntime *runtime,
-                                           uint64 *result_buffer) override;
+  DeviceAllocation allocate_memory_runtime(
+      const LlvmRuntimeAllocParams &params) override;
   void dealloc_memory(DeviceAllocation handle) override;
 
   std::unique_ptr<Pipeline> create_pipeline(
@@ -114,11 +125,12 @@ class CudaDevice : public Device {
 
  private:
   std::vector<AllocInfo> allocations_;
-  void validate_device_alloc(DeviceAllocation alloc) {
+  void validate_device_alloc(const DeviceAllocation alloc) {
     if (allocations_.size() <= alloc.alloc_id) {
       TI_ERROR("invalid DeviceAllocation");
     }
   }
+  std::unique_ptr<CudaCachingAllocator> caching_allocator_{nullptr};
 };
 
 }  // namespace cuda
