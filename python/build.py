@@ -27,7 +27,7 @@ def get_python_executable():
 
 def build(project_name):
     """Build and package the wheel file in root `dist` dir"""
-    if platform.system() == 'Linux':
+    if get_os_name() == 'linux':
         if re.search("^clang\+\+-*\d*", str(os.environ.get('CXX'))) is None:
             raise RuntimeError(
                 'Only the wheel with clang will be released to PyPI')
